@@ -14,6 +14,12 @@
 // --save-credential：只把本次令牌写入 <技能目录>/credentials/api-token.txt（0600）然后退出，不生成图片。
 // 用途：首次登录/拿到令牌后保存一次，之后运行脚本无需再传令牌。
 //
+// --check：只验证令牌有效性（GET /user/subscription），打印订阅档位后退出，不生成图片、不耗 Anlas。
+//
+// 代理环境：本机无法直连 NovelAI 时，优先用代理的 TUN/系统代理模式（全局接管）；
+// Node ≥24 也可给脚本加环境变量 NODE_USE_ENV_PROXY=1 和 HTTPS_PROXY=http://127.0.0.1:7890，
+// 让内置 fetch 走 HTTP 代理（仅设 HTTPS_PROXY 不加 NODE_USE_ENV_PROXY 是无效的）。
+//
 // 请求安全约束（强制）：仅 https；host 只允许 image.novelai.net / api.novelai.net；
 // 解析 DNS 后拒绝环回、私有和保留地址。
 
@@ -104,6 +110,7 @@ function parseArgs(argv) {
       case "--timeout-ms": a.timeoutMs = Number(next()); break;
       case "--token-file": a.tokenFile = next(); break;
       case "--save-credential": a.saveCredential = true; break;
+      case "--check": a.check = true; break;
       case "--no-quality": a.quality = false; break;
       case "--quiet": a.quiet = true; break;
       case "--fallback": a.fallback = true; break;
@@ -111,7 +118,7 @@ function parseArgs(argv) {
       default: fail(`unknown argument: ${k}`);
     }
   }
-  if (a.prompts.length === 0 && !a.saveCredential) fail("--prompt or --prompts-file is required (omit only with --save-credential)");
+  if (a.prompts.length === 0 && !a.saveCredential && !a.check) fail("--prompt or --prompts-file is required (omit only with --save-credential or --check)");
   a.model = a.model || "v4.5-full";
   if (!MODELS[a.model]) fail(`unknown model "${a.model}". available: ${Object.keys(MODELS).join(", ")}`);
   if (!Number.isInteger(a.n) || a.n < 1 || a.n > 32) fail("--n must be 1..32");
@@ -213,6 +220,33 @@ function buildPayload(args, cfg, promptText, seed) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const TIER_NAMES = { 0: "Paper", 1: "Tablet", 2: "Scroll", 3: "Opus" };
+
+async function checkAuth(token, tokenKind) {
+  // 注意：/user/subscription 走 image.novelai.net（2026-08-30 实测）；
+  // api.novelai.net 的同路径会 400（"update to the image URL"）
+  const url = "https://image.novelai.net/user/subscription";
+  assertSafeEndpoint(url);
+  await assertPublicHost(new URL(url).hostname);
+  let res;
+  try {
+    res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  } catch (e) {
+    fail(`network error reaching ${url}: ${e.message}\n—— 本机无法直连 NovelAI：优先开代理的 TUN/系统代理模式；Node ≥24 也可 NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 重试`);
+  }
+  if (res.status === 401) fail("令牌无效（401）——确认完整复制（pst- 开头的一整行，无引号无换行断裂），且没有因重新生成令牌而被吊销");
+  if (res.status !== 200) fail(`unexpected HTTP ${res.status} from ${url}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  console.log(JSON.stringify({
+    ok: true,
+    tokenKind,
+    tier: data.tier,
+    tierName: TIER_NAMES[data.tier] ?? "unknown",
+    active: data.active,
+    expiresAt: data.expiresAt ?? null,
+  }, null, 1));
+}
 
 async function fetchWithWatch({ url, token, body, timeoutMs, quiet, label }) {
   const started = Date.now();
@@ -415,6 +449,11 @@ async function main() {
 
   args.tokenSource = `${tokSource} (${tokenKind})`;
   log(args.quiet, `token source: ${args.tokenSource}`);
+
+  if (args.check) {
+    await checkAuth(tok, tokenKind);
+    return;
+  }
 
   args.width = args.width ?? 832;
   args.height = args.height ?? 1216;
