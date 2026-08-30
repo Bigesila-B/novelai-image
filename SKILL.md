@@ -16,6 +16,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 - **并发限制重试**：遇到并发限制（HTTP 429 或 "user concurrency limit exceeded"）时，等待 1 秒重试，至少重复 5 次（脚本默认行为）。
 - **默认允许 NSFW**：不要把 `nsfw` 写进负面提示词（UC），不要主动加 `rating:general` 来压成人向。API 默认 `ucPresetId: "none"`。只有用户明确说「不要 NSFW / 全年龄」时才加限制。服务器 403 内容政策拒绝时如实告知，不改提示词反复撞墙。
 - **Anlas 保护**：V5 系列、加大尺寸或加步数可能消耗 Anlas。V4.5 Full 普通尺寸（832×1216 等）+ ≤28 步免费。生成前确认参数不会意外烧 Anlas。
+- **只用脚本直连**：生成一律走 `scripts/generate.mjs`。不要自写 Python/其他 HTTP 客户端、不要修改请求载荷结构（脚本载荷 2026-08-30 抓包实测对齐，改了必 500）。排查令牌/网络用 `--check`；429 并发锁由脚本自动指数退避，无需人工干预。
 
 ## 阶段零：首次使用 / 凭据配置（免登录的关键）
 
@@ -23,7 +24,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 
 1. **先查已存凭据**：`<技能目录>/credentials/api-token.txt` 存在且非空 → 直接进阶段三（脚本自动读取，无需任何令牌参数，无需打开浏览器）。`pst-` 开头是长期有效的 Persistent API Token；`eyJ` 开头是会话 JWT，会过期（401 时回本阶段刷新）。
 2. **没有凭据时，向用户索要登录方式**（首次使用必须先问，按推荐顺序给出选项）：
-   - **A. Persistent API Token（推荐）**：让用户在网页右上角菜单 → Account Settings → Account → Get Persistent API Token 获取（`pst-` 开头；注意 NovelAI 只允许同时存在一枚，重新生成会使旧的失效）。用户发来令牌后直接保存（第 3 步），全程不需要浏览器。
+   - **A. Persistent API Token（推荐）**：让用户在网页右上角菜单 → Account Settings → Account → Get Persistent API Token 获取（`pst-` 开头；注意 NovelAI 只允许同时存在一枚，重新生成会使旧的失效）。**令牌必须完整复制**：`pst-` 开头的一整行，无引号、无换行断裂。用户发来后先用 `--check --token-file` 验证再保存（第 3 步），全程不需要浏览器。
    - **B. 浏览器已有登录态**：打开 `https://novelai.net/image` 检查，若已登录 → 按阶段三第 1 步提取会话令牌后保存（JWT 会过期，属正常，401 时刷新）。
    - **C. Cookie / D. 账密代填 / E. 手动登录**：按阶段一原流程处理，登录成功后提取令牌保存。
 3. **保存凭据**（二选一，效果相同；文件里只写令牌本身）：
@@ -31,7 +32,8 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
    node <技能目录>/scripts/generate.mjs --token-file <令牌临时文件> --save-credential
    ```
    或 agent 用 node `fs.writeFileSync`（0600）直接写入该路径。保存后删除令牌临时文件，不回显令牌内容。
-4. **验证**：跑一次生成（不带任何令牌参数）确认脚本自动读到了凭据；成功即配置完成。
+4. **验证**：先跑 `node <技能目录>/scripts/generate.mjs --check`（秒回、不耗 Anlas，输出订阅档位和令牌类型），通过后再跑一张 v4.5-full 免费图确认端到端；两步都成功才算配置完成。
+5. **网络受限环境**（本机无法直连 novelai.net）：优先让代理走 TUN/系统代理模式全局接管；Node ≥24 也可在命令前加 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890` 让脚本内置 fetch 走 HTTP 代理（只设 HTTPS_PROXY 不加 NODE_USE_ENV_PROXY 无效）。**不要**因此改用其他语言/工具重写请求。
 
 ## 阶段一：登录
 
@@ -65,7 +67,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
      --prompt "1girl, silver hair, ..." --model v4.5-full --out <工作目录>/nai-output
    ```
    - 模型键：`v5-full` / `v5-curated` / `v4.5-full` / `v4.5-curated` / `v4-full` / `v4-curated`
-   - 可选参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`、`--scale`、`--sampler`、`--seed`、`--n`（同一提示词张数）、`--prompts-file`（每行一条提示词）、`--concurrency`（并行路数，默认 1）、`--timeout-ms`（单次请求超时，默认 120000）、`--attempts`（并发重试上限，默认 5）、`--no-quality`、`--block-nsfw`（仅当用户明确要求全年龄时才加）
+   - 可选参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`、`--scale`、`--sampler`、`--seed`、`--n`（同一提示词张数）、`--prompts-file`（每行一条提示词）、`--concurrency`（并行路数，默认 1）、`--timeout-ms`（单次请求超时，默认 120000）、`--attempts`（并发重试上限，默认 5）、`--no-quality`、`--block-nsfw`（仅当用户明确要求全年龄时才加）；工具型参数：`--save-credential`（只保存凭据后退出）、`--check`（只验证令牌后退出）
    - 脚本自动：质量词插到第一个 `|` 之前（多角色不污染角色段）、Heavy UC、随机 seed、心跳日志（每 5 秒打印已等待秒数）、429 按 1 秒重试、解包 ZIP、写台账
    - **批量策略**：这个账号实测同时只能跑 1 张（429 `Concurrent generation is locked`）。默认 `--concurrency 1` 串行；不要盲目开 2。等待超过 5 秒会打心跳。429 用指数退避（1s/2s/4s/8s）等上一张完成，而不是每秒狂打。
 3. **读结果**：脚本 stdout 输出 JSON（`files` / `manifest` / `records`，含 seed 与端点），stderr 首行会显示令牌来源。失败时 stderr 有明确错误：401 令牌失效 → 凭据过期/被吊销，回阶段零重新获取并 `--save-credential` 刷新；402 Anlas 不足 → 换 v4.5-full 或降参数；403 内容政策 → 告知用户；429 重试耗尽 → 告知用户稍后再试。
@@ -83,7 +85,9 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 | 现象 | 处理 |
 |---|---|
 | 429 / "user concurrency limit exceeded" | 脚本自动 1 秒间隔重试 ≥5 次；仍失败告知用户稍后再试 |
-| 401 令牌失效 | 凭据过期（JWT）或被吊销：回阶段零重新获取令牌并 `--save-credential` 刷新；`pst-` 令牌 401 说明已被重置，需重新生成一枚 |
+| 401 令牌失效 | 先跑 `--check` 定位：401 = 令牌无效（复制不完整/被重新生成吊销）→ 回阶段零重新获取并 `--save-credential` 刷新 |
+| 500 / 531 / 551 等网关错误 | 多为代理链路问题或载荷被改坏：先用 `--check` 验证令牌，再用**原脚本**直连重试；仍 500 换网络节点，不要改脚本载荷 |
+| 本机无法直连 NovelAI | 代理开 TUN/系统代理模式全局接管（最稳）；Node ≥24 也可 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 node …` 让 fetch 走代理（只设 HTTPS_PROXY 不加 NODE_USE_ENV_PROXY 是无效的） |
 | 402 Anlas 不足 | 建议改用 v4.5-full（普通尺寸免费）或充值/降参数 |
 | 403 内容政策拒绝 | 告知用户，不绕过 |
 | "The paint's run dry" 弹窗（UI 流） | Anlas 不足/订阅过期：告知用户，不重复点击 |
@@ -94,5 +98,5 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 
 - 选模型 → `references/models.md`
 - 写提示词 → `references/prompt-formats.md`（每个版本都有模板和完整实例）
-- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+）
+- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+；`--check` 验令牌、`--save-credential` 存凭据）
 - Token 提取 / UI 细节 / Cookie 注入 / API 载荷实测记录 → `references/webui-and-api.md`
