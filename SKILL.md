@@ -1,0 +1,98 @@
+---
+name: novelai-image
+description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑图/生图：登录（手动/账密/Cookie/Persistent API Token）、首次使用后把令牌保存进技能目录实现下次免登录直连、按需求选择 NAI 模型（V5/V4.5/V4/V3）、按模型版本撰写专属格式提示词（Danbooru 标签优先）、通过直连 API 脚本生成并保存图片交付给用户，含并发失败自动重试与生成台账。只要用户提到 NovelAI/NAI、要在 novelai.net 跑图/生图/画图、提供 NovelAI Cookie 或 Token，或者上下文已确定用 NovelAI 出图时都使用本技能——即使用户只说"跑一张图"。
+---
+
+# NovelAI 跑图（浏览器登录 + 直连 API 生成）
+
+流程：首次使用先配置并保存凭据（阶段零）→ 需要时浏览器登录 novelai.net → 按需求选模型、按版本写提示词 → 脚本直连 API 生成 → 图片存盘并交付。凭据已保存时跳过登录，直接生成。
+
+浏览器操作使用本会话的 Browser Use 工具（control-browser），由主 agent 亲自执行，不得委托给子 agent。
+
+## 硬性规则（先读）
+
+- **凭证安全**：用户提供的账号、密码、Cookie 只用于本次登录。会话令牌允许写入仅本回合使用的临时文件（0600 权限，回合结束即删除）。**唯一允许的长期存储位置**是技能目录下 `credentials/api-token.txt`（0600，文件里只有令牌本身，无标签无注释）；除此之外不回显完整值、不写日志/台账/源码/示例、不发送到 novelai.net 以外的任何地址。打包或分享技能前必须删除 `credentials/` 目录。
+- **请求白名单**：任何请求只发往 `https://` + `image.novelai.net` / `api.novelai.net` / `novelai.net`。发请求前校验 host，拒绝 localhost、环回、私有和保留地址（脚本已内置该校验）。
+- **并发限制重试**：遇到并发限制（HTTP 429 或 "user concurrency limit exceeded"）时，等待 1 秒重试，至少重复 5 次（脚本默认行为）。
+- **默认允许 NSFW**：不要把 `nsfw` 写进负面提示词（UC），不要主动加 `rating:general` 来压成人向。API 默认 `ucPresetId: "none"`。只有用户明确说「不要 NSFW / 全年龄」时才加限制。服务器 403 内容政策拒绝时如实告知，不改提示词反复撞墙。
+- **Anlas 保护**：V5 系列、加大尺寸或加步数可能消耗 Anlas。V4.5 Full 普通尺寸（832×1216 等）+ ≤28 步免费。生成前确认参数不会意外烧 Anlas。
+
+## 阶段零：首次使用 / 凭据配置（免登录的关键）
+
+目标：首次使用时向用户索要登录方式，登录成功后把令牌保存进 `<技能目录>/credentials/api-token.txt`，之后每次使用直接生成，不再出现"连接不上账号/没登录"。
+
+1. **先查已存凭据**：`<技能目录>/credentials/api-token.txt` 存在且非空 → 直接进阶段三（脚本自动读取，无需任何令牌参数，无需打开浏览器）。`pst-` 开头是长期有效的 Persistent API Token；`eyJ` 开头是会话 JWT，会过期（401 时回本阶段刷新）。
+2. **没有凭据时，向用户索要登录方式**（首次使用必须先问，按推荐顺序给出选项）：
+   - **A. Persistent API Token（推荐）**：让用户在网页右上角菜单 → Account Settings → Account → Get Persistent API Token 获取（`pst-` 开头；注意 NovelAI 只允许同时存在一枚，重新生成会使旧的失效）。用户发来令牌后直接保存（第 3 步），全程不需要浏览器。
+   - **B. 浏览器已有登录态**：打开 `https://novelai.net/image` 检查，若已登录 → 按阶段三第 1 步提取会话令牌后保存（JWT 会过期，属正常，401 时刷新）。
+   - **C. Cookie / D. 账密代填 / E. 手动登录**：按阶段一原流程处理，登录成功后提取令牌保存。
+3. **保存凭据**（二选一，效果相同；文件里只写令牌本身）：
+   ```bash
+   node <技能目录>/scripts/generate.mjs --token-file <令牌临时文件> --save-credential
+   ```
+   或 agent 用 node `fs.writeFileSync`（0600）直接写入该路径。保存后删除令牌临时文件，不回显令牌内容。
+4. **验证**：跑一次生成（不带任何令牌参数）确认脚本自动读到了凭据；成功即配置完成。
+
+## 阶段一：登录
+
+优先级：已存储凭据（阶段零命中即跳过本阶段）> 浏览器已有会话 > Cookie/Token > 账密代填 > 手动登录。
+
+1. 打开 `https://novelai.net/image`，`waitForLoadState("domcontentloaded")` 后做一次 `domSnapshot()`。
+2. 判断登录态：快照里找 "Log in" / "Sign up" 入口（= 未登录），或用户头像、订阅标识、可用的 Generate 按钮（= 已登录）。
+3. 未登录时，按用户提供的方式处理：
+   - **Cookie/Token 方式**：见 `references/webui-and-api.md` 的注入步骤。注入后 reload 页面并重新验证登录态。
+   - **账密代填**：进入登录表单，填入 email + password 并提交。一旦出现验证码（reCAPTCHA）或两步验证，立即改让用户手动完成，不要反复尝试。
+   - **手动登录**：告诉用户"浏览器窗口已打开 NovelAI，请登录你的账号"，然后每 10 秒重新快照检查一次，最多等 5 分钟。
+4. 登录成功标准：快照中不再有 Log in 入口，Generate 按钮可用（会显示 Anlas 费用）。
+
+## 阶段二：选模型 + 写提示词
+
+1. 按 `references/models.md` 确定模型：用户点名的优先（"nai5" → V5，"nai4" → V4.5，除非明确说 V4）；没点名时按内容推断；免费优先时选 v4.5-full。
+2. 按 `references/prompt-formats.md` 生成与**所选模型版本匹配**的提示词。V3 和 V4/V5 语法互不兼容，绝不混用。标签词汇尽量遵循 Danbooru 规范。
+3. 首次生成或批量任务开始前，向用户展示将使用的「模型 + 正面提示词 + 负面提示词(UC)」；同一任务的连续迭代可直接跑。
+
+## 阶段三：生成（脚本直连 API，优先）
+
+前提：有可用令牌（已存凭据 / 用户提供的令牌 / 浏览器会话提取），生成走 `scripts/generate.mjs`，不依赖页面 UI。
+
+1. **确定令牌**（按优先级，不要每张图都重抽）：
+   - 已存凭据 `credentials/api-token.txt` 存在 → 什么都不用做，脚本自动读取；
+   - 用户直接提供了令牌/Cookie → 用 `--token-file`（Cookie 方式见 `references/webui-and-api.md`）；
+   - 都没有才从浏览器提取：在已登录页面上下文执行 `JSON.parse(localStorage["session"]).auth_token`，用 node 侧 `fs` 写入临时文件（`os.tmpdir()/nai-session-token.txt`，0600）。完整步骤见 `references/webui-and-api.md` §5。**首次登录后顺手执行 `--save-credential` 把令牌存进技能目录**（见阶段零第 3 步），下次免登录。
+2. **跑脚本**（凭据已保存时不带任何令牌参数；未保存时用 `NAI_TOKEN_FILE` 指向临时令牌文件）：
+   ```bash
+   node <技能目录>/scripts/generate.mjs \
+     --prompt "1girl, silver hair, ..." --model v4.5-full --out <工作目录>/nai-output
+   ```
+   - 模型键：`v5-full` / `v5-curated` / `v4.5-full` / `v4.5-curated` / `v4-full` / `v4-curated`
+   - 可选参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`、`--scale`、`--sampler`、`--seed`、`--n`（同一提示词张数）、`--prompts-file`（每行一条提示词）、`--concurrency`（并行路数，默认 1）、`--timeout-ms`（单次请求超时，默认 120000）、`--attempts`（并发重试上限，默认 5）、`--no-quality`、`--block-nsfw`（仅当用户明确要求全年龄时才加）
+   - 脚本自动：质量词插到第一个 `|` 之前（多角色不污染角色段）、Heavy UC、随机 seed、心跳日志（每 5 秒打印已等待秒数）、429 按 1 秒重试、解包 ZIP、写台账
+   - **批量策略**：这个账号实测同时只能跑 1 张（429 `Concurrent generation is locked`）。默认 `--concurrency 1` 串行；不要盲目开 2。等待超过 5 秒会打心跳。429 用指数退避（1s/2s/4s/8s）等上一张完成，而不是每秒狂打。
+3. **读结果**：脚本 stdout 输出 JSON（`files` / `manifest` / `records`，含 seed 与端点），stderr 首行会显示令牌来源。失败时 stderr 有明确错误：401 令牌失效 → 凭据过期/被吊销，回阶段零重新获取并 `--save-credential` 刷新；402 Anlas 不足 → 换 v4.5-full 或降参数；403 内容政策 → 告知用户；429 重试耗尽 → 告知用户稍后再试。
+4. **令牌清理**：回合结束前删除临时令牌文件。
+
+## 阶段四：交付
+
+1. 脚本已把图存到 `--out` 目录（默认 `<当前工作目录>/nai-output/`），命名 `NAI_{模型}_{yyyymmdd_hhmmss}.png`。
+2. 用 markdown 文件链接把图发给用户，多张用列表。建议同时展示 seed（复现要用）。
+3. 台账 `nai-output/manifest.jsonl` 每次生成追加一条记录（提示词、模型、seed、全部参数、文件路径）。「同图微调」= 取旧记录的 seed 加 `--seed`，改提示词重跑。
+4. UI 兜底：脚本失败（端点/载荷变更、令牌异常）时改走 UI 点击流程，见 `references/webui-and-api.md`。
+
+## 出错速查
+
+| 现象 | 处理 |
+|---|---|
+| 429 / "user concurrency limit exceeded" | 脚本自动 1 秒间隔重试 ≥5 次；仍失败告知用户稍后再试 |
+| 401 令牌失效 | 凭据过期（JWT）或被吊销：回阶段零重新获取令牌并 `--save-credential` 刷新；`pst-` 令牌 401 说明已被重置，需重新生成一枚 |
+| 402 Anlas 不足 | 建议改用 v4.5-full（普通尺寸免费）或充值/降参数 |
+| 403 内容政策拒绝 | 告知用户，不绕过 |
+| "The paint's run dry" 弹窗（UI 流） | Anlas 不足/订阅过期：告知用户，不重复点击 |
+| 脚本报"no PNG data"/端点变更 | 读 `references/webui-and-api.md`，必要时回退 UI 流程 |
+| 会话过期 / 未登录 | 回阶段零查凭据、阶段一重新登录 |
+
+## 参考资料
+
+- 选模型 → `references/models.md`
+- 写提示词 → `references/prompt-formats.md`（每个版本都有模板和完整实例）
+- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+）
+- Token 提取 / UI 细节 / Cookie 注入 / API 载荷实测记录 → `references/webui-and-api.md`
