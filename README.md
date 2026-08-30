@@ -28,16 +28,20 @@ node scripts/generate.mjs --token-file <令牌文件> --save-credential
 
 ## 代理 / 网络受限环境
 
-本机无法直连 novelai.net 时，按优先级：
+本机无法直连 novelai.net 时（表现：fetch failed / 连接超时 / Cloudflare 1010），两种方式任选：
 
-1. 代理客户端开 **TUN / 系统代理**模式（全局接管，脚本无需任何改动，最稳）；
-2. Node ≥ 24 可给命令加环境变量让内置 fetch 走 HTTP 代理：
+1. **脚本走代理（推荐）**：加 `--proxy` 指向代理的 HTTP/混合端口（Clash 默认 7890 或 7897）：
 
 ```bash
-NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 node scripts/generate.mjs --check
+node scripts/generate.mjs --check --proxy http://127.0.0.1:7897
+node scripts/generate.mjs --proxy http://127.0.0.1:7897 --prompt "..." --model v4.5-full --out ./nai-output
 ```
 
-注意：只设 `HTTPS_PROXY` 不加 `NODE_USE_ENV_PROXY=1` 是无效的（Node 的 fetch 不会自动读代理变量）。不要因此改用其他语言重写请求——脚本的载荷结构是抓包实测对齐的，改写后会出现 500/参数错误。
+也可用环境变量 `NAI_PROXY=http://127.0.0.1:7897` 代替 `--proxy`。脚本通过 HTTP CONNECT 隧道转发，零依赖，Windows/macOS/Linux 均可用，已在 Clash Verge 混合端口实测。
+
+2. **TUN / 系统代理模式**：在代理客户端全局接管流量，脚本不加任何参数直接用。
+
+注意：**不要**把 novelai.net 加进代理的 DIRECT（直连）规则——直连会被 Cloudflare 拦截（1010 错误）；也**不要**改用其他语言重写请求——脚本的载荷结构是抓包实测对齐的，改写后会出现 500/参数错误。
 
 ## 生成示例
 
@@ -47,7 +51,7 @@ node scripts/generate.mjs \
   --model v4.5-full --out ./nai-output
 ```
 
-常用参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`（默认 23）、`--seed`、`--n`、`--prompts-file`、`--concurrency`、`--check`（只验证令牌）、`--save-credential`（只保存凭据）、`--block-nsfw`（仅用户明确要全年龄时加）。
+常用参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`（默认 23）、`--seed`、`--n`、`--prompts-file`、`--concurrency`、`--check`（只验证令牌）、`--save-credential`（只保存凭据）、`--proxy`（走本地代理）、`--block-nsfw`（仅用户明确要全年龄时加）。
 
 ## 安全说明
 
