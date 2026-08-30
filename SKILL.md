@@ -11,29 +11,34 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 
 ## 硬性规则（先读）
 
-- **凭证安全**：用户提供的账号、密码、Cookie 只用于本次登录。会话令牌允许写入仅本回合使用的临时文件（0600 权限，回合结束即删除）。**唯一允许的长期存储位置**是技能目录下 `credentials/api-token.txt`（0600，文件里只有令牌本身，无标签无注释）；除此之外不回显完整值、不写日志/台账/源码/示例、不发送到 novelai.net 以外的任何地址。打包或分享技能前必须删除 `credentials/` 目录。
+- **凭证安全**：用户提供的账号、密码、Cookie 只用于本次登录。会话令牌允许写入仅本回合使用的临时文件（0600 权限，回合结束即删除）。**唯一允许的长期存储位置**是技能目录下 `credentials/`（`api-token.txt` 存令牌，0600，文件里只有令牌本身；`settings.json` 存代理地址等非机密设置）；除此之外不回显完整值、不写日志/台账/源码/示例、不发送到 novelai.net 以外的任何地址。打包或分享技能前必须删除 `credentials/` 目录。
 - **请求白名单**：任何请求只发往 `https://` + `image.novelai.net` / `api.novelai.net` / `novelai.net`。发请求前校验 host，拒绝 localhost、环回、私有和保留地址（脚本已内置该校验）。
 - **并发限制重试**：遇到并发限制（HTTP 429 或 "user concurrency limit exceeded"）时，等待 1 秒重试，至少重复 5 次（脚本默认行为）。
 - **默认允许 NSFW**：不要把 `nsfw` 写进负面提示词（UC），不要主动加 `rating:general` 来压成人向。API 默认 `ucPresetId: "none"`。只有用户明确说「不要 NSFW / 全年龄」时才加限制。服务器 403 内容政策拒绝时如实告知，不改提示词反复撞墙。
 - **Anlas 保护**：V5 系列、加大尺寸或加步数可能消耗 Anlas。V4.5 Full 普通尺寸（832×1216 等）+ ≤28 步免费。生成前确认参数不会意外烧 Anlas。
 - **只用脚本直连**：生成一律走 `scripts/generate.mjs`。不要自写 Python/其他 HTTP 客户端、不要修改请求载荷结构（脚本载荷 2026-08-30 抓包实测对齐，改了必 500）。排查令牌/网络用 `--check`；429 并发锁由脚本自动指数退避，无需人工干预。
 
-## 阶段零：首次使用 / 凭据配置（免登录的关键）
+## 阶段零：首次使用 / 引导配置（问答 → 测试 → 保存）
 
-目标：首次使用时向用户索要登录方式，登录成功后把令牌保存进 `<技能目录>/credentials/api-token.txt`，之后每次使用直接生成，不再出现"连接不上账号/没登录"。
+目标：首次使用时向用户**一次性**问清「登录方式 + 是否需要代理」，测试连通后把令牌和代理写入技能目录（`credentials/`），之后**新开对话也自动生效**，直接生成。
 
-1. **先查已存凭据**：`<技能目录>/credentials/api-token.txt` 存在且非空 → 直接进阶段三（脚本自动读取，无需任何令牌参数，无需打开浏览器）。`pst-` 开头是长期有效的 Persistent API Token；`eyJ` 开头是会话 JWT，会过期（401 时回本阶段刷新）。
-2. **没有凭据时，向用户索要登录方式**（首次使用必须先问，按推荐顺序给出选项）：
-   - **A. Persistent API Token（推荐）**：让用户在网页右上角菜单 → Account Settings → Account → Get Persistent API Token 获取（`pst-` 开头；注意 NovelAI 只允许同时存在一枚，重新生成会使旧的失效）。**令牌必须完整复制**：`pst-` 开头的一整行，无引号、无换行断裂。用户发来后先用 `--check --token-file` 验证再保存（第 3 步），全程不需要浏览器。
-   - **B. 浏览器已有登录态**：打开 `https://novelai.net/image` 检查，若已登录 → 按阶段三第 1 步提取会话令牌后保存（JWT 会过期，属正常，401 时刷新）。
-   - **C. Cookie / D. 账密代填 / E. 手动登录**：按阶段一原流程处理，登录成功后提取令牌保存。
-3. **保存凭据**（二选一，效果相同；文件里只写令牌本身）：
+1. **先查已存配置**：`credentials/api-token.txt` 存在且非空 → 配置已完成，直接进阶段三（脚本自动读取令牌和代理，无需任何参数）。`pst-` 开头是长期有效的 Persistent API Token；`eyJ` 开头是会话 JWT，会过期（401 时回本阶段刷新）。
+2. **没有配置时，向用户一次性提问**（一条消息问完，不要挤牙膏）：
+   - 「**登录方式选哪种？**推荐 Persistent API Token：网页右上角菜单 → Account Settings → Account → Get Persistent API Token（`pst-` 开头，**完整复制一整行**，无引号无换行；注意重新生成会使旧令牌失效）。也可以用浏览器已登录会话 / Cookie / 账密 / 手动登录。」
+   - 「**这台机器访问 NovelAI 需要代理吗？需要的话端口是多少？**（Clash 常见 7897 或 7890；不确定就说不知道，我帮你测）」
+3. **测试连通**（不保存、不耗 Anlas）：
    ```bash
-   node <技能目录>/scripts/generate.mjs --token-file <令牌临时文件> --save-credential
+   node <技能目录>/scripts/generate.mjs --check --token-file <令牌文件> --proxy http://127.0.0.1:<端口>
    ```
-   或 agent 用 node `fs.writeFileSync`（0600）直接写入该路径。保存后删除令牌临时文件，不回显令牌内容。
-4. **验证**：先跑 `node <技能目录>/scripts/generate.mjs --check`（秒回、不耗 Anlas，输出订阅档位和令牌类型），通过后再跑一张 v4.5-full 免费图确认端到端；两步都成功才算配置完成。
-5. **网络受限环境**（本机无法直连 novelai.net，表现为 fetch failed/超时/Cloudflare 1010）：给脚本加 `--proxy http://127.0.0.1:7897`（或环境变量 `NAI_PROXY`，指向 Clash/v2Ray 的 HTTP/混合端口），脚本走 HTTP CONNECT 隧道转发，零依赖、全平台可用；或在代理客户端开 TUN/系统代理模式全局接管（脚本无需参数）。**不要**因此改用其他语言/工具重写请求，也**不要**把 novelai.net 加进代理的 DIRECT 直连规则（直连会被 Cloudflare 1010 拦截）。
+   - 输出 `ok: true` + 订阅档位 → 通过，进入第 4 步；用户说不用代理就省略 `--proxy`。
+   - network error → 换端口再试（7897 / 7890 / 7899…）、确认代理客户端开着，或让代理开 TUN 模式；401 → 令牌复制不完整或已失效，让用户重新提供。
+4. **保存配置**（一条命令同时存令牌和代理）：
+   ```bash
+   node <技能目录>/scripts/generate.mjs --token-file <令牌临时文件> --proxy http://127.0.0.1:<端口> --save-credential
+   ```
+   不需要代理就省略 `--proxy`；用浏览器会话提取的令牌同理。保存后删除令牌临时文件，不回显令牌内容。以后改代理：`--save-proxy http://127.0.0.1:<新端口>`（清除用 `--save-proxy none`）。
+5. **端到端验证**：裸跑 `--check`（无任何参数，确认脚本自动读到了全部配置），再跑一张 v4.5-full 免费图；两步都成功才算配置完成。
+6. **代理说明**：脚本走 HTTP CONNECT 隧道，代理优先级 `--proxy` 参数 > 环境变量 `NAI_PROXY` > `credentials/settings.json`；TUN/系统代理模式下无需任何参数。**不要**自写 Python/其他客户端重写请求，**不要**把 novelai.net 加进代理的 DIRECT 直连规则（直连会被 Cloudflare 1010 拦截）。
 
 ## 阶段一：登录
 
@@ -98,5 +103,5 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 
 - 选模型 → `references/models.md`
 - 写提示词 → `references/prompt-formats.md`（每个版本都有模板和完整实例）
-- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+；`--check` 验令牌、`--save-credential` 存凭据、`--proxy` 走代理）
+- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+；`--check` 验令牌、`--save-credential` 存凭据+代理、`--save-proxy` 改代理、`--proxy` 临时走代理）
 - Token 提取 / UI 细节 / Cookie 注入 / API 载荷实测记录 → `references/webui-and-api.md`
