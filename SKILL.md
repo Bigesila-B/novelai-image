@@ -33,7 +33,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
    ```
    或 agent 用 node `fs.writeFileSync`（0600）直接写入该路径。保存后删除令牌临时文件，不回显令牌内容。
 4. **验证**：先跑 `node <技能目录>/scripts/generate.mjs --check`（秒回、不耗 Anlas，输出订阅档位和令牌类型），通过后再跑一张 v4.5-full 免费图确认端到端；两步都成功才算配置完成。
-5. **网络受限环境**（本机无法直连 novelai.net）：优先让代理走 TUN/系统代理模式全局接管；Node ≥24 也可在命令前加 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890` 让脚本内置 fetch 走 HTTP 代理（只设 HTTPS_PROXY 不加 NODE_USE_ENV_PROXY 无效）。**不要**因此改用其他语言/工具重写请求。
+5. **网络受限环境**（本机无法直连 novelai.net，表现为 fetch failed/超时/Cloudflare 1010）：给脚本加 `--proxy http://127.0.0.1:7897`（或环境变量 `NAI_PROXY`，指向 Clash/v2Ray 的 HTTP/混合端口），脚本走 HTTP CONNECT 隧道转发，零依赖、全平台可用；或在代理客户端开 TUN/系统代理模式全局接管（脚本无需参数）。**不要**因此改用其他语言/工具重写请求，也**不要**把 novelai.net 加进代理的 DIRECT 直连规则（直连会被 Cloudflare 1010 拦截）。
 
 ## 阶段一：登录
 
@@ -67,7 +67,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
      --prompt "1girl, silver hair, ..." --model v4.5-full --out <工作目录>/nai-output
    ```
    - 模型键：`v5-full` / `v5-curated` / `v4.5-full` / `v4.5-curated` / `v4-full` / `v4-curated`
-   - 可选参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`、`--scale`、`--sampler`、`--seed`、`--n`（同一提示词张数）、`--prompts-file`（每行一条提示词）、`--concurrency`（并行路数，默认 1）、`--timeout-ms`（单次请求超时，默认 120000）、`--attempts`（并发重试上限，默认 5）、`--no-quality`、`--block-nsfw`（仅当用户明确要求全年龄时才加）；工具型参数：`--save-credential`（只保存凭据后退出）、`--check`（只验证令牌后退出）
+   - 可选参数：`--negative`、`--width/--height`（默认 832×1216）、`--steps`、`--scale`、`--sampler`、`--seed`、`--n`（同一提示词张数）、`--prompts-file`（每行一条提示词）、`--concurrency`（并行路数，默认 1）、`--timeout-ms`（单次请求超时，默认 120000）、`--attempts`（并发重试上限，默认 5）、`--no-quality`、`--block-nsfw`（仅当用户明确要求全年龄时才加）；工具型参数：`--save-credential`（只保存凭据后退出）、`--check`（只验证令牌后退出）、`--proxy http://127.0.0.1:7897`（走本地代理，或环境变量 `NAI_PROXY`）
    - 脚本自动：质量词插到第一个 `|` 之前（多角色不污染角色段）、Heavy UC、随机 seed、心跳日志（每 5 秒打印已等待秒数）、429 按 1 秒重试、解包 ZIP、写台账
    - **批量策略**：这个账号实测同时只能跑 1 张（429 `Concurrent generation is locked`）。默认 `--concurrency 1` 串行；不要盲目开 2。等待超过 5 秒会打心跳。429 用指数退避（1s/2s/4s/8s）等上一张完成，而不是每秒狂打。
 3. **读结果**：脚本 stdout 输出 JSON（`files` / `manifest` / `records`，含 seed 与端点），stderr 首行会显示令牌来源。失败时 stderr 有明确错误：401 令牌失效 → 凭据过期/被吊销，回阶段零重新获取并 `--save-credential` 刷新；402 Anlas 不足 → 换 v4.5-full 或降参数；403 内容政策 → 告知用户；429 重试耗尽 → 告知用户稍后再试。
@@ -87,7 +87,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 | 429 / "user concurrency limit exceeded" | 脚本自动 1 秒间隔重试 ≥5 次；仍失败告知用户稍后再试 |
 | 401 令牌失效 | 先跑 `--check` 定位：401 = 令牌无效（复制不完整/被重新生成吊销）→ 回阶段零重新获取并 `--save-credential` 刷新 |
 | 500 / 531 / 551 等网关错误 | 多为代理链路问题或载荷被改坏：先用 `--check` 验证令牌，再用**原脚本**直连重试；仍 500 换网络节点，不要改脚本载荷 |
-| 本机无法直连 NovelAI | 代理开 TUN/系统代理模式全局接管（最稳）；Node ≥24 也可 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 node …` 让 fetch 走代理（只设 HTTPS_PROXY 不加 NODE_USE_ENV_PROXY 是无效的） |
+| 本机无法直连 NovelAI | 加 `--proxy http://127.0.0.1:7897`（Clash/v2Ray 的 HTTP/混合端口，或环境变量 `NAI_PROXY`）走 CONNECT 隧道；或代理开 TUN/系统代理模式。不要给 novelai.net 加 DIRECT 规则（直连被 Cloudflare 1010 拦截），不要自写 Python 客户端 |
 | 402 Anlas 不足 | 建议改用 v4.5-full（普通尺寸免费）或充值/降参数 |
 | 403 内容政策拒绝 | 告知用户，不绕过 |
 | "The paint's run dry" 弹窗（UI 流） | Anlas 不足/订阅过期：告知用户，不重复点击 |
@@ -98,5 +98,5 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 
 - 选模型 → `references/models.md`
 - 写提示词 → `references/prompt-formats.md`（每个版本都有模板和完整实例）
-- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+；`--check` 验令牌、`--save-credential` 存凭据）
+- 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+；`--check` 验令牌、`--save-credential` 存凭据、`--proxy` 走代理）
 - Token 提取 / UI 细节 / Cookie 注入 / API 载荷实测记录 → `references/webui-and-api.md`
