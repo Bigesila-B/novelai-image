@@ -13,12 +13,15 @@
 //
 // --save-credential：只把本次令牌写入 <技能目录>/credentials/api-token.txt（0600）然后退出，不生成图片。
 // 用途：首次登录/拿到令牌后保存一次，之后运行脚本无需再传令牌。
+// 若命令同时给了 --proxy，代理地址会一并写入 credentials/settings.json，一条命令完成首次配置。
+//
+// --save-proxy <url|none>：只把代理地址写入 credentials/settings.json（下次自动使用）后退出；none 清除代理设置。
 //
 // --check：只验证令牌有效性（GET /user/subscription），打印订阅档位后退出，不生成图片、不耗 Anlas。
 //
-// 代理环境：本机无法直连 NovelAI 时，加 --proxy http://127.0.0.1:7897（或环境变量 NAI_PROXY），
-// 脚本通过 HTTP CONNECT 隧道走本地代理（Clash/v2Ray 等混合端口），零依赖，不依赖 NODE_USE_ENV_PROXY；
-// 也可以在代理客户端开 TUN/系统代理模式全局接管，脚本无需任何参数。
+// 代理生效优先级：--proxy 参数 > 环境变量 NAI_PROXY > credentials/settings.json。
+// 本机无法直连 NovelAI 时，代理指向 Clash/v2Ray 等的 HTTP/混合端口（如 http://127.0.0.1:7897），
+// 脚本走 HTTP CONNECT 隧道，零依赖；也可以在代理客户端开 TUN/系统代理模式全局接管。
 //
 // 请求安全约束（强制）：仅 https；host 只允许 image.novelai.net / api.novelai.net；
 // 解析 DNS 后拒绝环回、私有和保留地址。
@@ -38,6 +41,26 @@ const PRIMARY_ENDPOINT = { url: "https://image.novelai.net/ai/generate-image", t
 const FALLBACK_ENDPOINT = { url: "https://api.novelai.net/ai/generate-image", timeoutMs: 8000 };
 // 凭据长期保存的唯一位置（0600，仅含令牌本身）；打包/分享技能前应删除 credentials 目录
 const CRED_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "credentials", "api-token.txt");
+// 用户设置（代理地址等；非机密但机器相关），与凭据同目录、一并被 .gitignore/打包排除
+const SETTINGS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "credentials", "settings.json");
+
+function loadSettings() {
+  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8")); } catch { return {}; }
+}
+
+function loadProxyFromSettings() {
+  const s = loadSettings();
+  return typeof s.proxy === "string" && s.proxy.trim() ? s.proxy.trim() : null;
+}
+
+function saveSettings(proxyUrl) {
+  const settings = loadSettings();
+  settings.proxy = proxyUrl;
+  settings.configuredAt = new Date().toISOString();
+  fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 1) + "\n", { mode: 0o600 });
+  try { fs.chmodSync(SETTINGS_FILE, 0o600); } catch {}
+}
 
 const MODELS = {
   "v5-full": {
@@ -115,6 +138,7 @@ function parseArgs(argv) {
       case "--save-credential": a.saveCredential = true; break;
       case "--check": a.check = true; break;
       case "--proxy": a.proxy = next(); break;
+      case "--save-proxy": a.saveProxy = next(); break;
       case "--no-quality": a.quality = false; break;
       case "--quiet": a.quiet = true; break;
       case "--fallback": a.fallback = true; break;
@@ -122,7 +146,7 @@ function parseArgs(argv) {
       default: fail(`unknown argument: ${k}`);
     }
   }
-  if (a.prompts.length === 0 && !a.saveCredential && !a.check) fail("--prompt or --prompts-file is required (omit only with --save-credential or --check)");
+  if (a.prompts.length === 0 && !a.saveCredential && !a.check && a.saveProxy === undefined) fail("--prompt or --prompts-file is required (omit only with --save-credential / --save-proxy / --check)");
   a.model = a.model || "v4.5-full";
   if (!MODELS[a.model]) fail(`unknown model "${a.model}". available: ${Object.keys(MODELS).join(", ")}`);
   if (!Number.isInteger(a.n) || a.n < 1 || a.n > 32) fail("--n must be 1..32");
@@ -130,9 +154,12 @@ function parseArgs(argv) {
   if (!Number.isInteger(a.concurrency) || a.concurrency < 1 || a.concurrency > 4) fail("--concurrency must be 1..4");
   if (!Number.isInteger(a.timeoutMs) || a.timeoutMs < 5000 || a.timeoutMs > 600000) fail("--timeout-ms must be 5000..600000");
   if (a.seed !== undefined && (!Number.isInteger(a.seed) || a.seed < 0 || a.seed >= 2 ** 32)) fail("--seed must be a uint32");
-  const proxyStr = a.proxy ?? process.env.NAI_PROXY ?? null;
+  // 代理生效优先级：--proxy 参数 > 环境变量 NAI_PROXY > credentials/settings.json
+  a.proxyArg = a.proxy ?? null;
+  const proxyStr = a.proxy ?? process.env.NAI_PROXY ?? loadProxyFromSettings();
   a.proxy = proxyStr ? new URL(proxyStr) : null;
-  if (a.proxy && a.proxy.protocol !== "http:") fail(`--proxy must be an http:// URL (got: ${proxyStr})`);
+  a.proxySource = a.proxy ? (a.proxyArg ? "--proxy" : process.env.NAI_PROXY ? "env NAI_PROXY" : "settings.json") : "none";
+  if (a.proxy && a.proxy.protocol !== "http:") fail(`proxy must be an http:// URL (got: ${proxyStr})`);
   return a;
 }
 
@@ -274,7 +301,7 @@ async function fetchViaProxy({ url, method, headers, body, timeoutMs, proxy }) {
 
 const TIER_NAMES = { 0: "Paper", 1: "Tablet", 2: "Scroll", 3: "Opus" };
 
-async function checkAuth(token, tokenKind, proxy) {
+async function checkAuth(token, tokenKind, args) {
   // 注意：/user/subscription 走 image.novelai.net（2026-08-30 实测）；
   // api.novelai.net 的同路径会 400（"update to the image URL"）
   const url = "https://image.novelai.net/user/subscription";
@@ -282,8 +309,8 @@ async function checkAuth(token, tokenKind, proxy) {
   await assertPublicHost(new URL(url).hostname);
   let status, text;
   try {
-    if (proxy) {
-      const got = await fetchViaProxy({ url, method: "GET", headers: { Authorization: `Bearer ${token}` }, body: null, timeoutMs: 30000, proxy });
+    if (args.proxy) {
+      const got = await fetchViaProxy({ url, method: "GET", headers: { Authorization: `Bearer ${token}` }, body: null, timeoutMs: 30000, proxy: args.proxy });
       status = got.res.status;
       text = got.buf.toString("utf8");
     } else {
@@ -304,6 +331,8 @@ async function checkAuth(token, tokenKind, proxy) {
     tierName: TIER_NAMES[data.tier] ?? "unknown",
     active: data.active,
     expiresAt: data.expiresAt ?? null,
+    proxy: args.proxy ? args.proxy.host : null,
+    proxySource: args.proxySource,
   }, null, 1));
 }
 
@@ -488,6 +517,20 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cfg = MODELS[args.model];
 
+  if (args.saveProxy !== undefined) {
+    const raw = args.saveProxy.trim();
+    const isOff = ["none", "direct", "off"].includes(raw.toLowerCase());
+    let proxy = null;
+    if (!isOff) {
+      try { proxy = new URL(raw); } catch { fail(`--save-proxy must be an http:// URL or "none" (got: ${raw})`); }
+      if (proxy.protocol !== "http:") fail(`--save-proxy must be an http:// URL or "none" (got: ${raw})`);
+    }
+    saveSettings(proxy ? proxy.origin : null);
+    log(args.quiet, `settings saved (proxy: ${proxy ? proxy.origin : "none"}) -> ${SETTINGS_FILE}`);
+    console.log(JSON.stringify({ ok: true, saved: SETTINGS_FILE, proxy: proxy ? proxy.origin : null }, null, 1));
+    return;
+  }
+
   let tok = null;
   let tokSource = null;
   if (args.tokenFile) { tok = fs.readFileSync(args.tokenFile, "utf8").trim(); tokSource = "--token-file"; }
@@ -504,15 +547,20 @@ async function main() {
     fs.writeFileSync(CRED_FILE, tok + "\n", { mode: 0o600 });
     try { fs.chmodSync(CRED_FILE, 0o600); } catch {}
     log(args.quiet, `credential saved (${tokenKind}) -> ${CRED_FILE}`);
-    console.log(JSON.stringify({ ok: true, saved: CRED_FILE, tokenKind }, null, 1));
+    if (args.proxyArg) {
+      saveSettings(args.proxy.origin);
+      log(args.quiet, `proxy setting saved (${args.proxy.origin}) -> ${SETTINGS_FILE}`);
+    }
+    console.log(JSON.stringify({ ok: true, saved: CRED_FILE, tokenKind, proxySaved: args.proxyArg ? args.proxy.origin : undefined }, null, 1));
     return;
   }
 
   args.tokenSource = `${tokSource} (${tokenKind})`;
   log(args.quiet, `token source: ${args.tokenSource}`);
+  log(args.quiet, `proxy: ${args.proxy ? `${args.proxy.host} (from ${args.proxySource})` : "none"}`);
 
   if (args.check) {
-    await checkAuth(tok, tokenKind, args.proxy);
+    await checkAuth(tok, tokenKind, args);
     return;
   }
 
