@@ -16,9 +16,9 @@
 //
 // --check：只验证令牌有效性（GET /user/subscription），打印订阅档位后退出，不生成图片、不耗 Anlas。
 //
-// 代理环境：本机无法直连 NovelAI 时，优先用代理的 TUN/系统代理模式（全局接管）；
-// Node ≥24 也可给脚本加环境变量 NODE_USE_ENV_PROXY=1 和 HTTPS_PROXY=http://127.0.0.1:7890，
-// 让内置 fetch 走 HTTP 代理（仅设 HTTPS_PROXY 不加 NODE_USE_ENV_PROXY 是无效的）。
+// 代理环境：本机无法直连 NovelAI 时，加 --proxy http://127.0.0.1:7897（或环境变量 NAI_PROXY），
+// 脚本通过 HTTP CONNECT 隧道走本地代理（Clash/v2Ray 等混合端口），零依赖，不依赖 NODE_USE_ENV_PROXY；
+// 也可以在代理客户端开 TUN/系统代理模式全局接管，脚本无需任何参数。
 //
 // 请求安全约束（强制）：仅 https；host 只允许 image.novelai.net / api.novelai.net；
 // 解析 DNS 后拒绝环回、私有和保留地址。
@@ -28,6 +28,9 @@ import path from "node:path";
 import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
+import http from "node:http";
+import https from "node:https";
+import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 
 const HOST_ALLOWLIST = new Set(["image.novelai.net", "api.novelai.net"]);
@@ -111,6 +114,7 @@ function parseArgs(argv) {
       case "--token-file": a.tokenFile = next(); break;
       case "--save-credential": a.saveCredential = true; break;
       case "--check": a.check = true; break;
+      case "--proxy": a.proxy = next(); break;
       case "--no-quality": a.quality = false; break;
       case "--quiet": a.quiet = true; break;
       case "--fallback": a.fallback = true; break;
@@ -126,6 +130,9 @@ function parseArgs(argv) {
   if (!Number.isInteger(a.concurrency) || a.concurrency < 1 || a.concurrency > 4) fail("--concurrency must be 1..4");
   if (!Number.isInteger(a.timeoutMs) || a.timeoutMs < 5000 || a.timeoutMs > 600000) fail("--timeout-ms must be 5000..600000");
   if (a.seed !== undefined && (!Number.isInteger(a.seed) || a.seed < 0 || a.seed >= 2 ** 32)) fail("--seed must be a uint32");
+  const proxyStr = a.proxy ?? process.env.NAI_PROXY ?? null;
+  a.proxy = proxyStr ? new URL(proxyStr) : null;
+  if (a.proxy && a.proxy.protocol !== "http:") fail(`--proxy must be an http:// URL (got: ${proxyStr})`);
   return a;
 }
 
@@ -221,23 +228,75 @@ function buildPayload(args, cfg, promptText, seed) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 通过 HTTP 代理的 CONNECT 隧道发 HTTPS 请求（零依赖，不依赖 NODE_USE_ENV_PROXY）
+async function fetchViaProxy({ url, method, headers, body, timeoutMs, proxy }) {
+  const target = new URL(url);
+  if (target.protocol !== "https:") throw new Error("proxied requests support https only");
+  const targetPort = Number(target.port) || 443;
+  const socket = await new Promise((resolve, reject) => {
+    const req = http.request({
+      host: proxy.hostname,
+      port: Number(proxy.port) || 80,
+      method: "CONNECT",
+      path: `${target.hostname}:${targetPort}`,
+      headers: { Host: `${target.hostname}:${targetPort}` },
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`proxy CONNECT timeout after ${timeoutMs}ms`)));
+    req.on("connect", (res, sock) => {
+      if (res.statusCode !== 200) { sock.destroy(); reject(new Error(`proxy CONNECT to ${proxy.host} failed: HTTP ${res.statusCode}`)); return; }
+      resolve(sock);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+  const tlsSocket = tls.connect({ socket, servername: target.hostname });
+  const res = await new Promise((resolve, reject) => {
+    const req = https.request({
+      host: target.hostname,
+      path: `${target.pathname}${target.search}`,
+      method,
+      headers,
+      createConnection: () => tlsSocket,
+    }, resolve);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout after ${timeoutMs}ms on ${url}`)));
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+  const chunks = [];
+  for await (const chunk of res) chunks.push(chunk);
+  const buf = Buffer.concat(chunks);
+  return {
+    res: { status: res.statusCode, headers: { get: (n) => res.headers[String(n).toLowerCase()] ?? null } },
+    buf,
+  };
+}
+
 const TIER_NAMES = { 0: "Paper", 1: "Tablet", 2: "Scroll", 3: "Opus" };
 
-async function checkAuth(token, tokenKind) {
+async function checkAuth(token, tokenKind, proxy) {
   // 注意：/user/subscription 走 image.novelai.net（2026-08-30 实测）；
   // api.novelai.net 的同路径会 400（"update to the image URL"）
   const url = "https://image.novelai.net/user/subscription";
   assertSafeEndpoint(url);
   await assertPublicHost(new URL(url).hostname);
-  let res;
+  let status, text;
   try {
-    res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (proxy) {
+      const got = await fetchViaProxy({ url, method: "GET", headers: { Authorization: `Bearer ${token}` }, body: null, timeoutMs: 30000, proxy });
+      status = got.res.status;
+      text = got.buf.toString("utf8");
+    } else {
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      status = res.status;
+      text = await res.text();
+    }
   } catch (e) {
-    fail(`network error reaching ${url}: ${e.message}\n—— 本机无法直连 NovelAI：优先开代理的 TUN/系统代理模式；Node ≥24 也可 NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 重试`);
+    fail(`network error reaching ${url}: ${e.message}\n—— 本机无法直连 NovelAI：加 --proxy http://127.0.0.1:7897 走本地代理（Clash/v2Ray 混合端口），或在代理客户端开 TUN/系统代理模式`);
   }
-  if (res.status === 401) fail("令牌无效（401）——确认完整复制（pst- 开头的一整行，无引号无换行断裂），且没有因重新生成令牌而被吊销");
-  if (res.status !== 200) fail(`unexpected HTTP ${res.status} from ${url}: ${(await res.text()).slice(0, 200)}`);
-  const data = await res.json();
+  if (status === 401) fail("令牌无效（401）——确认完整复制（pst- 开头的一整行，无引号无换行断裂），且没有因重新生成令牌而被吊销");
+  if (status !== 200) fail(`unexpected HTTP ${status} from ${url}: ${text.slice(0, 200)}`);
+  const data = JSON.parse(text);
   console.log(JSON.stringify({
     ok: true,
     tokenKind,
@@ -248,7 +307,7 @@ async function checkAuth(token, tokenKind) {
   }, null, 1));
 }
 
-async function fetchWithWatch({ url, token, body, timeoutMs, quiet, label }) {
+async function fetchWithWatch({ url, token, body, timeoutMs, quiet, label, proxy, method = "POST" }) {
   const started = Date.now();
   const beat = setInterval(() => {
     const s = Math.round((Date.now() - started) / 1000);
@@ -261,16 +320,18 @@ async function fetchWithWatch({ url, token, body, timeoutMs, quiet, label }) {
     }, timeoutMs);
     if (typeof t.unref === "function") t.unref();
   });
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   try {
-    const res = await Promise.race([
-      fetch(url, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body,
-      }),
-      timeoutPromise,
-    ]);
-    const buf = Buffer.from(await res.arrayBuffer());
+    let res, buf;
+    if (proxy) {
+      ({ res, buf } = await fetchViaProxy({ url, method, headers, body, timeoutMs, proxy }));
+    } else {
+      res = await Promise.race([
+        fetch(url, { method, headers, body }),
+        timeoutPromise,
+      ]);
+      buf = Buffer.from(await res.arrayBuffer());
+    }
     return { res, buf, elapsedMs: Date.now() - started };
   } catch (e) {
     if (e.timedOut) throw e;
@@ -292,7 +353,7 @@ async function callGenerate(token, payload, args, label) {
       let got;
       try {
         got = await fetchWithWatch({
-          url: ep.url, token, body, timeoutMs, quiet: args.quiet, label,
+          url: ep.url, token, body, timeoutMs, quiet: args.quiet, label, proxy: args.proxy,
         });
       } catch (e) {
         lastErr = e;
@@ -451,7 +512,7 @@ async function main() {
   log(args.quiet, `token source: ${args.tokenSource}`);
 
   if (args.check) {
-    await checkAuth(tok, tokenKind);
+    await checkAuth(tok, tokenKind, args.proxy);
     return;
   }
 
