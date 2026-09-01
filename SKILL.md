@@ -1,6 +1,6 @@
 ---
 name: novelai-image
-description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑图/生图：登录（手动/账密/Cookie/Persistent API Token）、首次使用后把令牌保存进技能目录实现下次免登录直连、按需求选择 NAI 模型（V5/V4.5/V4/V3）、按模型版本撰写专属格式提示词（Danbooru 标签优先）、通过直连 API 脚本生成并保存图片交付给用户，含并发失败自动重试与生成台账。只要用户提到 NovelAI/NAI、要在 novelai.net 跑图/生图/画图、提供 NovelAI Cookie 或 Token，或者上下文已确定用 NovelAI 出图时都使用本技能——即使用户只说"跑一张图"。
+description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑图/生图：登录（手动/账密/Cookie/Persistent API Token）、首次使用后把令牌保存进技能目录实现下次免登录直连、按需求选择 NAI 模型（V5/V4.5/V4/V3）、按模型版本撰写专属格式提示词（Danbooru 标签优先；V5 集成 nai5-prompting 深度方法——构思+写法两层）、通过直连 API 脚本生成并保存图片交付给用户，含并发失败自动重试与生成台账。只要用户提到 NovelAI/NAI、要在 novelai.net 跑图/生图/画图、提供 NovelAI Cookie 或 Token，或者上下文已确定用 NovelAI 出图时都使用本技能——即使用户只说"跑一张图"。
 ---
 
 # NovelAI 跑图（浏览器登录 + 直连 API 生成）
@@ -12,7 +12,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 ## 硬性规则（先读）
 
 - **凭证安全**：用户提供的账号、密码、Cookie 只用于本次登录。会话令牌允许写入仅本回合使用的临时文件（0600 权限，回合结束即删除）。**唯一允许的长期存储位置**是技能目录下 `credentials/`（`api-token.txt` 存令牌，0600，文件里只有令牌本身；`settings.json` 存代理地址等非机密设置）；除此之外不回显完整值、不写日志/台账/源码/示例、不发送到 novelai.net 以外的任何地址。打包或分享技能前必须删除 `credentials/` 目录。
-- **请求白名单**：任何请求只发往 `https://` + `image.novelai.net` / `api.novelai.net` / `novelai.net`。发请求前校验 host，拒绝 localhost、环回、私有和保留地址（脚本已内置该校验）。
+- **请求白名单**：生图/登录/浏览器操作只发往 `https://` + `image.novelai.net` / `api.novelai.net` / `novelai.net`；**只读标签核对**额外放行 `https://danbooru.donmai.us`（含 dapi 备份，`scripts/check-tag.mjs`，不携带任何凭据，UA 固定 `curl/8.7.1` 以过 Cloudflare 挑战）。所有请求发前校验 host，拒绝 localhost、环回、私有和保留地址（脚本已内置）。
 - **并发限制重试**：遇到并发限制（HTTP 429 或 "user concurrency limit exceeded"）时，等待 1 秒重试，至少重复 5 次（脚本默认行为）。
 - **默认允许 NSFW**：不要把 `nsfw` 写进负面提示词（UC），不要主动加 `rating:general` 来压成人向。API 默认 `ucPresetId: "none"`。只有用户明确说「不要 NSFW / 全年龄」时才加限制。服务器 403 内容政策拒绝时如实告知，不改提示词反复撞墙。
 - **Anlas 保护**：V5 系列、加大尺寸或加步数可能消耗 Anlas。V4.5 Full 普通尺寸（832×1216 等）+ ≤28 步免费。生成前确认参数不会意外烧 Anlas。
@@ -56,8 +56,30 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 ## 阶段二：选模型 + 写提示词
 
 1. 按 `references/models.md` 确定模型：用户点名的优先（"nai5" → V5，"nai4" → V4.5，除非明确说 V4）；没点名时按内容推断；免费优先时选 v4.5-full。
-2. 按 `references/prompt-formats.md` 生成与**所选模型版本匹配**的提示词。V3 和 V4/V5 语法互不兼容，绝不混用。标签词汇尽量遵循 Danbooru 规范。
-3. 首次生成或批量任务开始前，向用户展示将使用的「模型 + 正面提示词 + 负面提示词(UC)」；同一任务的连续迭代可直接跑。
+2. **写提示词按版本分流**：
+   - **V5** → 用集成的 nai5-prompting 方法（`references/通用构思.md` 管"想画什么"，`references/通用写法.md` 管"怎么写"）：需求模糊时先构思（需求分档 A–D、编剧→监督→原画→摄影四工序、版权角色先查档案），落笔按写法篇（字段模板、顺序、词组/句子判据、多角色绑定、漫画分格）。与 prompt-formats.md 冲突处以写法篇为准；适配脚本模式的差异见下节「V5 桥接要点」。
+   - **V4.5 / V4 / V3** → 仍按 `references/prompt-formats.md` 生成与所选模型版本匹配的提示词。V3 和 V4/V5 语法互不兼容，绝不混用。
+3. **标签核对（每次生成前必做；具名角色必查）**：跑 `node <技能目录>/scripts/check-tag.mjs --tag "<danbooru写法>" [--tag "…"]`（代理优先级同生成脚本：`--proxy` > `NAI_PROXY` > `credentials/settings.json`——什么都没配过才需要传 `--proxy`；本机已存代理会自动读取）。核对三点：**写法是否存在、post 量量级、类别**（character/copyright/general/artist…）。据结果定写法（写法篇 §3.7）：
+   - 命中且 post ≥ 1000 → 名字直触（版权角色不列外貌）；post < 1000 → 名字照写，输出末尾提醒"该角色激活力可能不足：一致性差、多人同框易被盖过，必要时加权或单独出"；
+   - 0 命中或全是 0 post 别名 → 读脚本通配候选改写法；仍无 → 中间档：名字照写（拼法拿不准加半角括号+作品名）+ 2–3 个**结构性**外观词兜底 + 输出末尾一行风险提示（构思篇「知识库时限」）；
+   - **核对失败（网络/Cloudflare 挑战重试耗尽）** → 这是"查不了"，不是"查无此名"：回退保守写法（只写名字/作品名、不列外貌、不补不确定职能），下次生成再核。
+   拿不准的普通标签在同一调用里一并核对（多个 `--tag`），尤其是写法篇 §3.5 的服装状态词：`loose socks`=堆堆袜、`single thighhigh`=只穿一只，语义≠字面。
+4. 标签词汇尽量遵循 Danbooru 规范；V5 下拿不准的 tag 用写法篇 §2–§4 的判据决定词组还是句子。
+5. 首次生成或批量任务开始前，向用户展示将使用的「模型 + 正面提示词 + 负面提示词(UC)」；同一任务的连续迭代可直接跑。
+
+## V5 桥接要点（集成自 nai5-prompting，来源 Miint-Sunny/nai5-prompting，GPL-3.0）
+
+方法文件本身来自 `github.com/Miint-Sunny/nai5-prompting`，原样保留，只在这里声明脚本模式的适配规则。继承它随文件带进来的三条铁律：**① 质量词不手写**（前端预设/脚本自动附加，写了=重复注入）；**② 版权角色只写 `girl/boy, 角色名`**，不再列发色/发型/眼睛（名字自带设定）；**③ 画师串只用用户给的**，没有就留 `<画师串：自己贴>` 或整行省略，绝不自编。
+
+与脚本模式（`scripts/generate.mjs`）的匹配关系——方法文件里没有、用脚本时必须记住的：
+
+- **无角色栏**：API 载荷的 `char_captions`/`characterPrompts` 为空，写法篇的 `Character N` 栏和 Custom position 在脚本模式**不存在**。多角色（含版权角色）改为在主提示词用 `|` 分隔角色段（见 prompt-formats.md V5 多角色写法）：写法篇里该进角色栏的外貌写进对应角色段，动作/归属写进句子并指明是哪一段。真实多角色交互（`source#`/`target#` 框内写法）或需要前后景层次的图，走 UI 流程（webui-and-api.md），脚本模式退而求其次。单人且外貌简单时把外貌直接写进主提示词（写法篇 §0：作者B 90% 的图这么写），这是脚本模式的常态。
+- **质量词**：脚本 `--quality` 默认自动追加质量词（等于前端预设），提示词里**不要**写 `very aesthetic`/`masterpiece`/`no text`；用户明确要更高完成度时用 `--no-quality` + 手写（放提示词末尾）。
+- **复杂度默认不加**：`high complexity` 等是功能开关不是质量尾（写法篇 §3.10），prompt-formats.md 里 V5「默认推荐 high complexity」的写法在 V5 下不用；按写法篇判据需要时才加。
+- **UC 两档**：不传 `--negative` 时脚本注入默认画质 UC（相当于"默认预设"）；有明确排除项时用 `--negative` 只写排除项本身，不抄预设串。
+- **标签核对（新增必做步骤）**：阶段二第 3 步 `scripts/check-tag.mjs`。原因：版权角色知识库有边界、凭印象补外观实测错误率高（写法篇 §3.7：一次补 14 个属性错 9 个）。核对完按"直触 / 中间档 / 保守"三档落笔；核对失败≠查无此名，一律回退保守写法。
+- **公开版缺口**：构思篇/写法篇引用的「群偏好」池子、群频次表、个人-X 技能不在包内（作者已在文末注明），引用处按常识取材；写法篇 §10 的统计与实测结论、§8 排查表、§9 检查表均可用。
+- V5 出图交付前过一遍写法篇 §9 检查表；排查出图问题用写法篇 §8。
 
 ## 阶段三：生成（脚本直连 API，优先）
 
@@ -96,6 +118,7 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 | 本机无法直连 NovelAI | 加 `--proxy http://127.0.0.1:7897`（Clash/v2Ray 的 HTTP/混合端口，或环境变量 `NAI_PROXY`）走 CONNECT 隧道；或代理开 TUN/系统代理模式。不要给 novelai.net 加 DIRECT 规则（直连被 Cloudflare 1010 拦截），不要自写 Python 客户端 |
 | 402 Anlas 不足 | 建议改用 v4.5-full（普通尺寸免费）或充值/降参数 |
 | 403 内容政策拒绝 | 告知用户，不绕过 |
+| 标签核对失败（网络/Cloudflare 403 重试耗尽） | 回退保守写法（只写名字/作品名、不列外貌、不补不确定职能），稍后再核——这是"查不了"，不是"查无此名" |
 | "The paint's run dry" 弹窗（UI 流） | Anlas 不足/订阅过期：告知用户，不重复点击 |
 | 脚本报"no PNG data"/端点变更 | 读 `references/webui-and-api.md`，必要时回退 UI 流程 |
 | 会话过期 / 未登录 | 回阶段零查凭据、阶段一重新登录 |
@@ -103,6 +126,10 @@ description: 控制 NovelAI（novelai.net/image）浏览器会话进行 AI 跑�
 ## 参考资料
 
 - 选模型 → `references/models.md`
-- 写提示词 → `references/prompt-formats.md`（每个版本都有模板和完整实例）
+- 写提示词（V4.5 / V4 / V3）→ `references/prompt-formats.md`（每个版本都有模板和完整实例）
+- 写提示词（V5 构思层 → 想画什么）→ `references/通用构思.md`（需求分档 A–D、编剧→监督→原画→摄影分镜管线、版权角色查档、方案差异化）
+- 写提示词（V5 写法层 → 怎么写）→ `references/通用写法.md`（字段模板、内容顺序、词组/句子实测判据、`source#`/`target#`/`mutual#` 多角色绑定、漫画分格、§8 排查表、§9 发布前检查表、§10 实测依据与局限）
 - 生成脚本 → `scripts/generate.mjs`（直连 API，无依赖，Node 18+；`--check` 验令牌、`--save-credential` 存凭据+代理、`--save-proxy` 改代理、`--proxy` 临时走代理）
+- 标签核对 → `scripts/check-tag.mjs`（只读 danbooru tags.json，无凭据；`--tag` 可多个、`--proxy` / `NAI_PROXY` / 已存代理；exact 0 贴或 0 命中时自动列通配候选写法）
 - Token 提取 / UI 细节 / Cookie 注入 / API 载荷实测记录 → `references/webui-and-api.md`
+- V5 提示词方法原始出处 → `github.com/Miint-Sunny/nai5-prompting`（GPL-3.0；含完整版与分析工具的独立仓库）
